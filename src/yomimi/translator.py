@@ -9,12 +9,17 @@ Batches all sentences from a page into one Claude call to minimize cost.
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass, asdict
 from typing import Any
 
 from anthropic import Anthropic
 
 from .config import claude_api_key, CLAUDE_MODEL
+
+
+def _log(msg: str) -> None:
+    print(f"[yomimi.translate] {msg}", flush=True, file=sys.stderr)
 
 
 @dataclass
@@ -70,6 +75,7 @@ class Translator:
         if not sentences:
             return []
 
+        _log(f"Calling Claude with {len(sentences)} sentence(s)...")
         numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(sentences))
         msg = self._client.messages.create(
             model=CLAUDE_MODEL,
@@ -77,6 +83,7 @@ class Translator:
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": numbered}],
         )
+        _log("Claude response received.")
         raw = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
         data = _parse_json_array(raw)
 

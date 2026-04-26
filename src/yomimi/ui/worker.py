@@ -1,6 +1,8 @@
 """Background worker that runs OCR + translation off the UI thread."""
 from __future__ import annotations
 
+import sys
+import traceback
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
@@ -22,9 +24,15 @@ class AnalysisWorker(QObject):
 
     def run(self) -> None:
         try:
+            print(f"[yomimi.worker] Starting analysis of {self.image_path.name}",
+                  flush=True, file=sys.stderr)
             result = analyze_page(self.image_path, self.ocr, self.translator)
+            print(f"[yomimi.worker] Done: {len(result.regions)} regions",
+                  flush=True, file=sys.stderr)
             self.finished.emit(result)
         except Exception as exc:  # surface to UI rather than crashing
+            tb = traceback.format_exc()
+            print(f"[yomimi.worker] FAILED:\n{tb}", flush=True, file=sys.stderr)
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 

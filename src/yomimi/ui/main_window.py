@@ -20,6 +20,7 @@ from ..passive import PassiveMode
 from ..translator import Translator
 from ..zip_loader import BatchLoader
 from .reader_view import ReaderWidget
+from .warmup import start_warmup
 from .worker import start_analysis
 
 
@@ -38,6 +39,8 @@ class MainWindow(QMainWindow):
         self.index: int = -1
         self.results: dict[Path, PageResult] = {}
         self._active_thread = None
+        self._models_ready = False
+        self._pending_analysis: Path | None = None
 
         self.reader = ReaderWidget(self)
         self.setCentralWidget(self.reader)
@@ -47,6 +50,15 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar(self))
         self.status_label = QLabel("Ready. Open files (Ctrl+O) to begin.")
         self.statusBar().addWidget(self.status_label)
+
+        # Kick off model loading in the background so the UI stays responsive
+        # and the user sees real progress instead of a frozen "Analyzing...".
+        self._warmup_thread, _ = start_warmup(
+            self, self.ocr,
+            on_progress=self._set_status,
+            on_done=self._on_warmup_done,
+            on_fail=self._on_warmup_failed,
+        )
 
     # -- actions / toolbar ---------------------------------------------
     def _build_actions(self) -> None:
@@ -111,17 +123,38 @@ class MainWindow(QMainWindow):
             self._kick_analysis(path)
 
     def _kick_analysis(self, path: Path) -> None:
+        if not self._models_ready:
+            self._pending_analysis = path
+            self._set_status(
+                f"Waiting for OCR models to finish loading before analyzing {path.name}..."
+            )
+            return
         if self.translator is None:
             try:
                 self.translator = Translator()
             except Exception as exc:
                 QMessageBox.critical(self, "YoMimi", f"Translator init failed: {exc}")
                 return
-        self._set_status(f"Analyzing {path.name}... (first run downloads ML models)")
+        self._set_status(f"Analyzing {path.name}...")
         self._active_thread, _ = start_analysis(
             self, path, self.ocr, self.translator,
             on_done=self._on_analyzed,
             on_fail=self._on_failed,
+        )
+
+    def _on_warmup_done(self) -> None:
+        self._models_ready = True
+        self._set_status("OCR models ready. Open files (Ctrl+O) to begin.")
+        if self._pending_analysis is not None:
+            path, self._pending_analysis = self._pending_analysis, None
+            self._kick_analysis(path)
+
+    def _on_warmup_failed(self, msg: str) -> None:
+        self._set_status(f"Model load failed: {msg}")
+        QMessageBox.critical(
+            self, "YoMimi",
+            f"Failed to load OCR models:\n{msg}\n\n"
+            "Check the terminal for the full traceback."
         )
 
     def _on_analyzed(self, result: PageResult) -> None:

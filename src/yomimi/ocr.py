@@ -11,12 +11,17 @@ Models are downloaded on first use (~500 MB-1 GB total).
 """
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
+
+
+def _log(msg: str) -> None:
+    print(f"[yomimi.ocr] {msg}", flush=True, file=sys.stderr)
 
 
 @dataclass
@@ -48,26 +53,36 @@ class OCREngine:
     # --- lazy loaders ---------------------------------------------------
     def _detector(self):
         if self._reader is None:
+            _log("Loading EasyOCR detector (first run downloads ~70MB)...")
             import easyocr  # heavy import
-            # Japanese only; English usually rides along OK in most builds,
-            # but mixing causes warnings. For pure Japanese pages this is fine.
-            self._reader = easyocr.Reader(["ja", "en"], gpu=False, verbose=False)
+            # verbose=True prints download progress on first run.
+            self._reader = easyocr.Reader(["ja", "en"], gpu=False, verbose=True)
+            _log("EasyOCR ready.")
         return self._reader
 
     def _recognizer(self):
         if self._mocr is None:
+            _log("Loading manga-ocr (first run downloads ~450MB)...")
             from manga_ocr import MangaOcr
             self._mocr = MangaOcr()
+            _log("manga-ocr ready.")
         return self._mocr
 
     # --- public API -----------------------------------------------------
     def analyze(self, image_path: Path) -> list[TextRegion]:
+        _log(f"Analyzing {image_path.name}")
         img = Image.open(image_path).convert("RGB")
         arr = np.array(img)
 
         reader = self._detector()
+        _log("Running text detection...")
         # detect() returns (horizontal_boxes, free_form_boxes).
         h_boxes, f_boxes = reader.detect(arr)
+        n_h = len(h_boxes[0]) if h_boxes else 0
+        n_f = len(f_boxes[0]) if f_boxes else 0
+        _log(f"Detected {n_h} horizontal + {n_f} free-form boxes; recognizing...")
+        # Warm up recognizer once before the loop.
+        self._recognizer()
         regions: list[TextRegion] = []
 
         # horizontal_boxes are [x_min, x_max, y_min, y_max].
