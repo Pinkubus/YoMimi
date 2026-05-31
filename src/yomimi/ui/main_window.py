@@ -19,9 +19,9 @@ from ..ocr import OCREngine
 from ..passive import PassiveMode
 from ..translator import Translator
 from ..zip_loader import BatchLoader
+from .prefetch import PrefetchManager
 from .reader_view import ReaderWidget
 from .warmup import start_warmup
-from .worker import start_analysis
 
 
 class MainWindow(QMainWindow):
@@ -38,9 +38,11 @@ class MainWindow(QMainWindow):
         self.pages: list[Path] = []
         self.index: int = -1
         self.results: dict[Path, PageResult] = {}
-        self._active_thread = None
         self._models_ready = False
-        self._pending_analysis: Path | None = None
+        self._pending_show: Path | None = None
+        # How many pages ahead to prefetch in the background.
+        self.prefetch_lookahead = 5
+        self.prefetch: PrefetchManager | None = None  # built after warmup
 
         self.reader = ReaderWidget(self)
         self.setCentralWidget(self.reader)
@@ -53,7 +55,7 @@ class MainWindow(QMainWindow):
 
         # Kick off model loading in the background so the UI stays responsive
         # and the user sees real progress instead of a frozen "Analyzing...".
-        self._warmup_thread, _ = start_warmup(
+        self._warmup_thread, self._warmup_worker = start_warmup(
             self, self.ocr,
             on_progress=self._set_status,
             on_done=self._on_warmup_done,
@@ -67,11 +69,11 @@ class MainWindow(QMainWindow):
         self.act_open.triggered.connect(self.open_files)
 
         self.act_prev = QAction("Previous page", self)
-        self.act_prev.setShortcut(Qt.Key_Left)
+        self.act_prev.setShortcut(Qt.Key_PageUp)
         self.act_prev.triggered.connect(lambda: self.show_page(self.index - 1))
 
         self.act_next = QAction("Next page", self)
-        self.act_next.setShortcut(Qt.Key_Right)
+        self.act_next.setShortcut(Qt.Key_PageDown)
         self.act_next.triggered.connect(lambda: self.show_page(self.index + 1))
 
         self.act_passive = QAction("Toggle passive mode", self)
@@ -107,6 +109,8 @@ class MainWindow(QMainWindow):
         if not self.pages:
             QMessageBox.information(self, "YoMimi", "No images found in the selection.")
             return
+        if self.prefetch is not None:
+            self.prefetch.set_pages(self.pages)
         self.show_page(0)
 
     # -- navigation -----------------------------------------------------
@@ -116,38 +120,47 @@ class MainWindow(QMainWindow):
         idx = max(0, min(idx, len(self.pages) - 1))
         self.index = idx
         path = self.pages[idx]
-        self._set_status(f"Page {idx+1}/{len(self.pages)}  -  {path.name}")
-        # Show image immediately, even before analysis completes.
-        self.reader.set_page(path, self.results.get(path))
-        if path not in self.results:
-            self._kick_analysis(path)
-
-    def _kick_analysis(self, path: Path) -> None:
-        if not self._models_ready:
-            self._pending_analysis = path
+        cached = self.results.get(path)
+        self.reader.set_page(path, cached)
+        if cached:
             self._set_status(
-                f"Waiting for OCR models to finish loading before analyzing {path.name}..."
+                f"Page {idx+1}/{len(self.pages)}  -  {path.name}  -  "
+                f"{len(cached.regions)} regions"
             )
+        else:
+            self._set_status(
+                f"Page {idx+1}/{len(self.pages)}  -  {path.name}  -  analyzing..."
+            )
+        self._schedule_prefetch()
+
+    def _schedule_prefetch(self) -> None:
+        """Prioritize the currently-viewed page, then queue the next N."""
+        if not self._models_ready or not self.pages or self.index < 0:
             return
-        if self.translator is None:
-            try:
-                self.translator = Translator()
-            except Exception as exc:
-                QMessageBox.critical(self, "YoMimi", f"Translator init failed: {exc}")
-                return
-        self._set_status(f"Analyzing {path.name}...")
-        self._active_thread, _ = start_analysis(
-            self, path, self.ocr, self.translator,
-            on_done=self._on_analyzed,
-            on_fail=self._on_failed,
-        )
+        if self.prefetch is None:
+            return
+        current = self.pages[self.index]
+        if current not in self.results:
+            self.prefetch.request(current, priority=True)
+        # Queue the next `lookahead` pages in reading order.
+        for offset in range(1, self.prefetch_lookahead + 1):
+            ni = self.index + offset
+            if ni >= len(self.pages):
+                break
+            nxt = self.pages[ni]
+            if nxt not in self.results:
+                self.prefetch.request(nxt, priority=False)
 
     def _on_warmup_done(self) -> None:
         self._models_ready = True
         self._set_status("OCR models ready. Open files (Ctrl+O) to begin.")
-        if self._pending_analysis is not None:
-            path, self._pending_analysis = self._pending_analysis, None
-            self._kick_analysis(path)
+        # Build the prefetch manager now that models are loaded.
+        self.prefetch = PrefetchManager(
+            self, self.ocr, translator_factory=Translator
+        )
+        self.prefetch.page_ready.connect(self._on_analyzed)
+        self.prefetch.page_failed.connect(self._on_failed)
+        self._schedule_prefetch()
 
     def _on_warmup_failed(self, msg: str) -> None:
         self._set_status(f"Model load failed: {msg}")
@@ -164,12 +177,15 @@ class MainWindow(QMainWindow):
             self.reader.set_page(result.image_path, result)
             self._set_status(
                 f"Page {self.index+1}/{len(self.pages)}  -  {result.image_path.name}  "
-                f"-  {len(result.regions)} regions"
+                f"-  {len(result.regions)} regions  (next pages prefetching...)"
             )
 
-    def _on_failed(self, msg: str) -> None:
-        self._set_status(f"Analysis failed: {msg}")
-        QMessageBox.warning(self, "YoMimi", f"Analysis failed:\n{msg}")
+    def _on_failed(self, path, msg: str) -> None:
+        self._set_status(f"Analysis failed for {Path(path).name}: {msg}")
+        # Only popup if it was the current page; background prefetch failures
+        # shouldn't interrupt reading.
+        if 0 <= self.index < len(self.pages) and self.pages[self.index] == path:
+            QMessageBox.warning(self, "YoMimi", f"Analysis failed:\n{msg}")
 
     # -- passive --------------------------------------------------------
     def toggle_passive(self) -> None:
@@ -182,5 +198,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(text)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self.prefetch is not None:
+            self.prefetch.shutdown()
         self.loader.cleanup()
         super().closeEvent(event)

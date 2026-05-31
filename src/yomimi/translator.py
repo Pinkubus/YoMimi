@@ -76,7 +76,12 @@ class Translator:
             return []
 
         _log(f"Calling Claude with {len(sentences)} sentence(s)...")
-        numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(sentences))
+        # A "sentence" entry may now be a whole speech bubble / paragraph and
+        # contain its own newlines; flatten so our 1./2./3. numbering stays
+        # parseable on Claude's side.
+        numbered = "\n".join(
+            f"{i+1}. {s.replace(chr(10), ' / ')}" for i, s in enumerate(sentences)
+        )
         msg = self._client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=2048,
